@@ -1,0 +1,7 @@
+apiVersion: 1
+datasources:
+  - name: MIDI
+    uid: midi-datasource
+    type: tskarhed-midi-datasource
+    access: proxy
+    isDefault: false

@@ -5,6 +5,24 @@
 **Status**: Draft
 **Input**: User description: "Build a Grafana frontend datasource plugin which connects to the browser's MIDI API."
 
+## Clarifications
+
+### Session 2026-04-23
+
+- Q: What is the expected DataFrame output format for all datasource modes? → A: Always time-series (timeline) format; Grafana can display the latest values using built-in panel/reduction options regardless of mode.
+- Q: How should each mode's time-series output be structured, and is the mode selector retained? → A: Mode selector is retained. Raw events: one time-series row per MIDI message. Note states and Drums: streamed as State Timeline-compatible data (on/off transitions). All modes emit time-series DataFrames.
+- Q: Are Notes/Drums/Timeline separate pipelines or views over the raw stream, and is Timeline a separate mode? → A: Notes and Drums are filtered+transformed views over the raw MIDI event stream (not independent pipelines). Timeline is NOT a separate mode — it is removed from the mode selector; Notes mode already emits State Timeline-compatible data, and Grafana's panel type handles the timeline view.
+- Q: How should note/drum state be represented per time-series row, and does drum decay apply? → A: `Velocity` field = note/drum velocity on Note On, `null` on Note Off. No 200ms decay timer for drums — state is always driven by what the MIDI input sends (Note On activates, Note Off deactivates).
+- Q: Should Notes and Drums modes emit long or wide DataFrame format? → A: Both — a format toggle in the query editor lets users switch per panel between long format (one row per event, requires "Partition by values" transform) and wide format (one field per note/drum name, no transform needed).
+- Q: In wide format, should unchanged active notes carry forward their last velocity in each new row? → A: Yes — wide format is stateful: each emitted row represents the full current state of all known notes/drums. Active notes keep their last velocity until Note Off (null); multiple notes can be active in parallel and are all visible in the same row.
+- Q: In what order should wide format columns appear? → A: Ascending MIDI note number order — Notes mode columns sorted C-1 (note 0) → G9 (note 127); Drums mode columns sorted by note number 35 → 81. Columns appear in pitch order regardless of which notes are played first.
+- Q: In Notes mode, what audio plays when a channel 10 Note On arrives? → A: Drum sound only (percussive synthesis, not a pitched tone); channel 10 always triggers drum audio in both Notes and Drums modes.
+- Q: In Drums mode, which channels trigger drum sounds and appear in the drums DataFrame? → A: All 16 MIDI channels — Drums mode is not restricted to channel 10; any channel's Note On/Off feeds the drum display and audio.
+- Q: Can note range be obtained from the MIDI device, and should auto-range be kept? → A: Web MIDI API does not expose device note range; `noteRangeAuto` is removed — note range is always a fixed [noteRangeMin, noteRangeMax] configured by the user (default 36–84).
+- Q: How should noteRangeMin/Max be set in the query editor? → A: Replace the two separate number inputs with a single `RangeSlider` component (two-handle slider).
+- Q: In Notes mode wide format, what column order and pre-population apply? → A: Descending MIDI note number order (highest note first, e.g. C6 → C2 for default range); ALL columns for every note in [noteRangeMin, noteRangeMax] are pre-populated at subscription start, even before any note is played.
+- Q: Should the same behaviors (descending order, pre-populated columns) apply to Drums mode wide format, and if so which columns? → A: Yes — Drums mode wide format pre-populates a 6-piece core kit in descending note order: 51 (Ride Cymbal 1), 49 (Crash Cymbal 1), 46 (Open Hi-Hat), 42 (Closed Hi-Hat), 38 (Acoustic Snare), 36 (Bass Drum 1). Drums outside this preset that are actually hit appear dynamically appended after the preset columns.
+
 ## User Scenarios & Testing _(mandatory)_
 
 ### User Story 1 - Raw MIDI Message Monitor (Priority: P1)
@@ -73,8 +91,10 @@ and (c) highlights and sound stop when keys are released.
    **Then** the corresponding note name is highlighted with visual intensity proportional to
    velocity (soft press = dim, hard press = bright).
 
-2. **Given** a note is played, **When** the Note On message is received, **Then** a pitched
-   sound for that note plays through the browser's audio output within 50ms.
+2. **Given** a note is played on a non-channel-10 channel, **When** the Note On message is
+   received, **Then** a pitched sound for that note plays within 50ms. **Given** a Note On
+   arrives on channel 10 (GM percussion channel) in Notes mode, **Then** a drum sound (not a
+   pitched tone) plays within 50ms.
 
 3. **Given** a note is being held, **When** the corresponding Note Off message is received,
    **Then** the note highlight disappears and the sound fades out.
@@ -87,44 +107,12 @@ and (c) highlights and sound stop when keys are released.
 
 ---
 
-### User Story 3 - Piano Timeline View (Priority: P3)
+### ~~User Story 3 - Piano Timeline View~~ _(removed — superseded by clarification 2026-04-23)_
 
-A musician selects the "Timeline" display mode in a panel query and sees a scrolling piano-roll
-style view where each note is a horizontal lane and its active duration is shown as a bar spanning
-the time it was held. The range of notes displayed can be configured manually (e.g., "C3–C5") or
-set to automatically expand as new notes are received. This lets the musician review patterns and
-note durations over time.
-
-**Why this priority**: The timeline view adds analytical depth — it reveals note patterns,
-durations, and overlaps that are invisible in the live intensity view. It depends on reliable
-Note On/Off tracking established in Story 2.
-
-**Independent Test**: Can be fully tested by selecting "Timeline" mode in the panel query,
-playing a sequence of notes including held notes of different durations, and verifying that:
-(a) each note appears as a labelled lane, (b) a bar starts on key press and ends on key release,
-(c) the time axis scrolls so recent events stay visible, and (d) the note range can be configured.
-
-**Acceptance Scenarios**:
-
-1. **Given** the "Timeline" mode is selected, **When** a note is pressed, **Then** a bar begins
-   in that note's lane at the current timestamp.
-
-2. **Given** a note bar has started, **When** the corresponding Note Off is received, **Then**
-   the bar ends at that timestamp, visually representing the held duration.
-
-3. **Given** the timeline is scrolling forward in time, **When** new notes are played, **Then**
-   recent events remain visible on the right edge and older events scroll left.
-
-4. **Given** the note range configuration is set to "auto", **When** the view is displayed,
-   **Then** the visible lanes expand as new notes arrive (or reflect the device's reported
-   capability if available).
-
-5. **Given** the note range is manually configured (e.g., "C3–C5"), **When** a note outside
-   that range is played, **Then** it does not appear in the timeline (excluded from this view
-   only; it still appears in a raw message panel if one is open).
-
-6. **Given** multiple notes overlap in time, **When** they are displayed, **Then** each occupies
-   its own lane and overlapping bars are clearly distinguishable.
+> **Removed**: "Timeline" is no longer a separate query mode. Notes mode emits State
+> Timeline-compatible time-series data (note on/off transitions); the State Timeline panel type
+> in Grafana handles the timeline view. The note-range filter (formerly US3) is retained as an
+> optional filter within Notes mode.
 
 ---
 
@@ -140,27 +128,27 @@ percussive synthesis. It is placed last because it is the most complex story and
 of the pitched-note stories.
 
 **Independent Test**: Can be fully tested by selecting "Drums" mode and sending MIDI Note On
-messages on channel 10 using GM drum note numbers (e.g., note 36 = Bass Drum, note 38 = Snare),
+messages on **any channel** using GM drum note numbers (e.g., note 36 = Bass Drum, note 38 = Snare),
 and verifying that: (a) the correct drum piece name is highlighted, (b) a percussive sound plays
-within 50ms, and (c) the highlight fades after 200ms.
+within 50ms, and (c) the highlight clears on Note Off.
 
 **Acceptance Scenarios**:
 
-1. **Given** the "Drums" mode is selected and a MIDI message on the GM drum channel arrives with
+1. **Given** the "Drums" mode is selected and a MIDI message arrives on **any channel** with
    a recognized note number, **When** the Note On is received, **Then** the corresponding drum
    piece label is highlighted.
 
 2. **Given** a drum note is triggered, **When** the Note On is received, **Then** a percussive
    sound appropriate for that drum piece plays within 50ms.
 
-3. **Given** a drum hit is displayed, **When** 200ms have elapsed, **Then** the highlight fades
-   automatically (drum kits typically do not send Note Off messages).
+3. ~~**Given** a drum hit is displayed, **When** 200ms have elapsed, **Then** the highlight fades
+   automatically.~~ _(removed — state is driven by MIDI Note Off, not a timer)_
 
 4. **Given** multiple drum pieces are hit in rapid succession, **When** each Note On is received,
    **Then** each drum piece highlights independently without interfering with others.
 
-5. **Given** a note number on the drum channel does not match any GM drum mapping, **When** it
-   arrives, **Then** it is shown as "Unknown Drum (note NNN)" rather than silently ignored.
+5. **Given** a note number on any channel does not match any GM drum mapping, **When** it
+   arrives in Drums mode, **Then** it is shown as "Unknown Drum (note NNN)" rather than silently ignored.
 
 ---
 
@@ -195,26 +183,51 @@ within 50ms, and (c) the highlight fades after 200ms.
   when the limit is reached.
 - **FR-006**: The real-time note view MUST display currently active notes with visual intensity
   proportional to velocity (0–127).
-- **FR-007**: The real-time note view MUST play a pitched sound for each Note On message and stop
-  it on the corresponding Note Off (or velocity-0 Note On).
-- **FR-008**: The piano timeline view MUST display each note as a horizontal lane with a bar
-  representing the held duration, scrolling forward in real-time.
-- **FR-009**: The piano timeline MUST support a configurable note range; when set to "auto" it
-  MUST expand to include all notes received or the device's reported capability.
-- **FR-010**: The drum visualization view MUST map incoming messages on the GM drum channel to
-  named drum pieces using the GM1 drum note map (notes 35–81).
+- **FR-007**: The real-time note view MUST play a **pitched** sound for each non-channel-10 Note On
+  and a **drum** sound (percussive synthesis) for each channel-10 Note On; the corresponding
+  Note Off (or velocity-0 Note On) stops the sound in both cases.
+- ~~**FR-008**: The piano timeline view MUST display each note as a horizontal lane with a bar
+  representing the held duration, scrolling forward in real-time.~~ _(removed — Timeline is not
+  a separate mode; handled by Grafana's State Timeline panel configured against Notes mode output)_
+- **FR-009**: Notes mode MUST support a configurable note range [noteRangeMin, noteRangeMax] set
+  via a **RangeSlider** (two-handle slider) in the query editor; default range is [36, 84]
+  (C2–C6). Notes outside the range MUST be excluded from the output. _(The `noteRangeAuto`
+  option is removed — the Web MIDI API does not expose device note range.)_
+- **FR-010**: The drum visualization view MUST map incoming messages on **any MIDI channel** to
+  named drum pieces using the GM1 drum note map (notes 35–81); Drums mode is not restricted to
+  the GM drum channel (channel 10).
 - **FR-011**: The drum visualization MUST play a percussive sound for each recognized drum hit
   within 50ms of message receipt.
-- **FR-012**: Drum hit highlights MUST automatically fade after 200ms in the absence of a
-  Note Off message.
+- ~~**FR-012**: Drum hit highlights MUST automatically fade after 200ms in the absence of a
+  Note Off message.~~ _(removed — drum state is driven entirely by MIDI input: Note On
+  activates, Note Off deactivates; no decay timer)_
 - **FR-013**: The datasource MUST detect when a selected MIDI device disconnects and display a
   reconnection prompt in the affected panel without crashing the dashboard.
 - **FR-014**: When the browser does not support MIDI access, the datasource MUST display an
   actionable error message with browser compatibility information.
 - **FR-015**: Sound playback MUST function using only browser-native capabilities — no external
   audio service or server-side component is required.
-- **FR-016**: All four display modes (raw, real-time notes, piano timeline, drums) MUST be
-  independently selectable as query types in the panel editor.
+- **FR-016**: Three query modes (Raw, Notes, Drums) MUST be independently selectable in the
+  panel query editor. _(Timeline is not a mode — it is a Grafana panel type used with Notes
+  mode output.)_
+- **FR-017**: The datasource MUST emit time-series DataFrames (each containing a `Time` field) for
+  all query modes; display differences between modes are achieved through Grafana panel
+  configuration (e.g., "Last value" reduction, "Partition by values" transform) rather than
+  different DataFrame schemas.
+- **FR-018**: For Notes and Drums modes, the query editor MUST expose a **format toggle**
+  (`Long` / `Wide`) that controls the DataFrame shape: Long format emits one row per event with
+  a `NoteName`/`DrumName` string field plus `Velocity`; Wide format emits one field per
+  note/drum name with `Velocity` as the value — each row MUST carry forward the current velocity
+  for ALL active notes/drums so multiple simultaneous notes are visible in the same row. An
+  active note/drum retains its last velocity until a Note Off (null) is received.
+  **Notes mode wide format**: columns MUST be ordered **descending** by MIDI note number (highest
+  first); ALL columns for every note in [noteRangeMin, noteRangeMax] MUST be pre-populated at
+  subscription start with `null` velocity, even before any note is played.
+  **Drums mode wide format**: columns MUST be pre-populated with the 6-piece core kit preset in
+  descending note order — 51 (Ride Cymbal 1), 49 (Crash Cymbal 1), 46 (Open Hi-Hat), 42 (Closed
+  Hi-Hat), 38 (Acoustic Snare), 36 (Bass Drum 1) — with `null` velocity at subscription start;
+  any drum hit outside this preset MUST be appended dynamically after the preset columns.
+  Raw mode always uses long format.
 
 ### Key Entities
 
@@ -224,10 +237,14 @@ within 50ms, and (c) the highlight fades after 200ms.
   (1–16), and up to two data bytes (e.g., note number and velocity).
 - **Note**: An active pitched note with: note number (0–127), note name (e.g., "C4"), velocity
   (0–127), and state (on / off).
-- **Note Duration**: A note event used by the piano timeline with: note number, start timestamp,
-  and end timestamp (or "open" if Note Off has not yet been received).
+- ~~**Note Duration**: A note event used by the piano timeline with: note number, start timestamp,
+  and end timestamp (or "open" if Note Off has not yet been received).~~ _(removed — Timeline is
+  not a separate mode; Notes mode time-series covers this via State Timeline panel)_
 - **Drum Hit**: A drum event mapped to a named GM1 drum piece with: note number, drum name,
-  velocity, and a display decay timer.
+  velocity, and state (on / off, driven by MIDI Note On / Note Off).
+- **Query**: A panel query with fields: `deviceId` (string), `mode` (`raw` | `notes` | `drums`),
+  `format` (`long` | `wide`, applies to Notes and Drums modes), and `noteRangeMin` /
+  `noteRangeMax` (Notes mode only; defaults 36–84; set via RangeSlider; `noteRangeAuto` removed).
 
 ## Success Criteria _(mandatory)_
 
@@ -257,8 +274,10 @@ within 50ms, and (c) the highlight fades after 200ms.
   and Edge. Firefox and Safari are out of scope unless the user installs a browser extension.
 - Device selection is per-panel via the query editor; one datasource instance serves all panels,
   each of which independently selects its device.
-- Drum messages follow the General MIDI (GM1) standard: percussion on channel 10 (1-indexed),
-  notes 35–81 map to standard drum names.
+- Drum note names follow the General MIDI (GM1) standard: notes 35–81 map to standard drum names.
+  In Drums mode, messages on **any channel** are accepted and mapped to drum names. Channel 10
+  is the conventional GM percussion channel but is not the sole accepted channel in Drums mode.
+  In Notes mode, channel 10 Note On triggers drum audio (not a pitched sound).
 - Sound playback for notes uses a simple pitched tone to represent pitch and velocity; a full
   instrument simulation (e.g., realistic piano samples) is out of scope.
 - Sound playback for drums uses synthesized percussive sounds; sample-based drum sounds are out
@@ -268,3 +287,6 @@ within 50ms, and (c) the highlight fades after 200ms.
 - A "velocity 0 Note On" message is treated as a Note Off, consistent with the MIDI standard.
 - The piano timeline scrolls continuously in real-time and is not a static or historical playback
   view.
+- All query modes emit time-series DataFrames (with a `Time` field); Grafana's built-in panel
+  options and transformations are used to control what is displayed, avoiding mode-specific
+  non-time-series DataFrame schemas.

@@ -4,6 +4,7 @@
   "name": "Midi-Datasource",
   "id": "tskarhed-midi-datasource",
   "metrics": true,
+  "streaming": true,
   "info": {
     "description": "",
     "author": {

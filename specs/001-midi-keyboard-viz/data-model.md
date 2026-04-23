@@ -1,6 +1,6 @@
 # Data Model: MIDI Keyboard Datasource Plugin
 
-**Branch**: `001-midi-keyboard-viz` | **Date**: 2026-03-18
+**Branch**: `001-midi-keyboard-viz` | **Date**: 2026-04-23 (updated)
 
 ---
 
@@ -9,8 +9,24 @@
 ### MidiQueryMode
 
 ```typescript
-export type MidiQueryMode = 'raw' | 'notes' | 'timeline' | 'drums';
+export type MidiQueryMode = 'raw' | 'notes' | 'drums';
 ```
+
+> **Note**: Timeline is NOT a separate mode. Notes mode emits State Timeline-compatible
+> time-series DataFrames. Configure a State Timeline panel with "Partition by values" on
+> `NoteName` to get a piano-roll view.
+
+### MidiQueryFormat
+
+```typescript
+export type MidiQueryFormat = 'long' | 'wide';
+```
+
+- `'long'`: one row per event with NoteName/DrumName as a string field (requires
+  "Partition by values" Grafana transform for State Timeline)
+- `'wide'`: one column per note/drum name, value = Velocity | null (State Timeline native,
+  no transform needed)
+- Raw mode always uses long format regardless of this setting.
 
 ### MidiQuery (extends DataQuery from @grafana/schema)
 
@@ -25,21 +41,28 @@ export interface MidiQuery extends DataQuery {
   mode: MidiQueryMode;
 
   /**
-   * Timeline mode only: minimum MIDI note number to display (0–127).
+   * Output DataFrame format for Notes and Drums modes.
+   * Raw mode always uses long format regardless of this setting.
+   * Default: 'long'
+   */
+  format: MidiQueryFormat;
+
+  /**
+   * Notes mode only: minimum MIDI note number to display (0–127).
    * Ignored when noteRangeAuto is true.
    * Default: 36 (C2)
    */
   noteRangeMin: number;
 
   /**
-   * Timeline mode only: maximum MIDI note number to display (0–127).
+   * Notes mode only: maximum MIDI note number to display (0–127).
    * Ignored when noteRangeAuto is true.
    * Default: 84 (C6)
    */
   noteRangeMax: number;
 
   /**
-   * Timeline mode only: when true, expand the note range dynamically
+   * Notes mode only: when true, expand the note range dynamically
    * as new notes are received rather than using noteRangeMin/Max.
    * Default: false
    */
@@ -49,6 +72,7 @@ export interface MidiQuery extends DataQuery {
 export const DEFAULT_QUERY: Partial<MidiQuery> = {
   deviceId: '',
   mode: 'raw',
+  format: 'long',
   noteRangeMin: 36,
   noteRangeMax: 84,
   noteRangeAuto: false,
@@ -130,25 +154,7 @@ export interface MidiDeviceInfo {
 
 ## Per-Device Runtime State (maintained by DataSource)
 
-### ActiveNote (for Notes mode)
-
-```typescript
-export interface ActiveNote {
-  /** MIDI note number (0–127) */
-  noteNumber: number;
-
-  /** Human-readable note name, e.g. "C4", "D#5" */
-  noteName: string;
-
-  /** Velocity at Note On (1–127). Never 0 (velocity-0 Note On is treated as Note Off). */
-  velocity: number;
-
-  /** Timestamp when Note On was received (performance.now()) */
-  startTime: number;
-}
-```
-
-### NoteEvent (for Timeline mode)
+### NoteEvent (for Notes mode)
 
 ```typescript
 export interface NoteEvent {
@@ -163,28 +169,31 @@ export interface NoteEvent {
 
   /**
    * Velocity (1–127) when the note was pressed; null when released.
-   * Using velocity as the state value allows State Timeline to color bars by intensity.
    * null serialises to null in the DataFrame, which State Timeline treats as "state ended".
    */
   velocity: number | null;
 }
 ```
 
-### DrumHit (for Drums mode)
+### DrumEvent (for Drums mode)
 
 ```typescript
-export interface DrumHit {
-  /** MIDI note number (35–81 for GM1 standard drums) */
+export interface DrumEvent {
+  /** When this state change occurred (ms since epoch, for DataFrame time field) */
+  timestamp: number;
+
+  /** MIDI note number (0–127) */
   noteNumber: number;
 
-  /** GM1 drum piece name, e.g. "Bass Drum 1", "Acoustic Snare" */
+  /** GM1 drum piece name, or "Unknown Drum (note NNN)" for out-of-map notes */
   drumName: string;
 
-  /** Velocity at hit (1–127) */
-  velocity: number;
-
-  /** Timestamp when hit was received (performance.now()) */
-  hitTime: number;
+  /**
+   * Velocity (1–127) on Note On; null on Note Off.
+   * null serialises to null in the DataFrame, which State Timeline treats as "state ended".
+   * State is driven entirely by MIDI input — no timer-based decay.
+   */
+  velocity: number | null;
 }
 ```
 
@@ -209,55 +218,66 @@ Raw          | string    | Hex representation, e.g. "90 3C 64"
 - Capped at 1000 rows; oldest dropped when limit reached
 - Emitted: on every incoming MIDI message
 
-### Notes Mode — use with: Table panel or custom visualization
-
-```
-Field name   | FieldType | Description
--------------|-----------|----------------------------------------------
-NoteNumber   | number    | MIDI note number (0–127)
-NoteName     | string    | Note name e.g. "C4", "D#5"
-Velocity     | number    | Velocity at Note On (1–127)
-```
-
-- One row per currently active note (Note On received, Note Off not yet received)
-- Empty DataFrame when no notes are active
-- Emitted: on every Note On or Note Off that changes the active note set
-
-### Timeline Mode — use with: State Timeline panel + "Partition by values" transformation
+### Notes Mode (Long format) — use with: State Timeline + "Partition by values" on NoteName
 
 ```
 Field name   | FieldType | Description
 -------------|-----------|----------------------------------------------
 Time         | time      | ms since epoch when state change occurred
 NoteNumber   | number    | MIDI note number (0–127)
-NoteName     | string    | Note name e.g. "C4"
+NoteName     | string    | Note name e.g. "C4", "D#5"
 Velocity     | number    | Velocity (1–127) on Note On; null on Note Off
 ```
 
 - One row per state-change event (Note On → velocity value, Note Off → null)
-- When noteRangeAuto=false: only emit events for notes within [noteRangeMin, noteRangeMax]
-- When noteRangeAuto=true: emit all events; range expands dynamically
-- Accumulated since subscription start; the full event history is re-emitted on each new event
-- **Panel setup required**:
-  1. Add "Partition by values" transformation, partition field = `NoteName`
-  2. State Timeline maps velocity values to a color gradient (0=transparent, 127=fully opaque)
-  3. Optionally add "Filter by value" transformation to constrain the visible note range
+- When `noteRangeAuto=false`: only emit events for notes within [noteRangeMin, noteRangeMax]
+- When `noteRangeAuto=true`: emit all events; range expands dynamically
+- Full event history accumulated since subscription start; re-emitted on each new event
+- **Panel setup**: "Partition by values" on `NoteName` → State Timeline piano-roll view
 
-### Drums Mode — use with: Table panel or custom visualization
+### Notes Mode (Wide format) — use with: State Timeline (native, no transform needed)
 
 ```
 Field name   | FieldType | Description
 -------------|-----------|----------------------------------------------
-NoteNumber   | number    | MIDI note number (35–81)
-DrumName     | string    | GM1 drum name e.g. "Bass Drum 1"
-Velocity     | number    | Velocity at last hit (1–127), or 0 if inactive
-Active       | boolean   | true within 200ms decay window after hit
+Time         | time      | ms since epoch when state change occurred
+<NoteName>   | number    | One column per distinct note seen; value = Velocity|null
 ```
 
-- One row per GM1 drum piece in the map (47 standard rows, notes 35–81)
-- Unknown note numbers on channel 10 (outside 35–81): appended as extra rows with
-  `DrumName = "Unknown Drum (note NNN)"`
-- Emitted: on every drum-channel Note On, and when each 200ms decay timer fires
+- **Stateful**: each row carries the full current state — active notes retain their last velocity
+  until Note Off (null); multiple notes active in parallel appear in the same row
+- **Columns sorted by ascending MIDI note number** (pitch order, C-1=0 to G9=127), regardless
+  of which notes were played first
+- Example: Note On C4 vel=100, then Note On E4 vel=80 → row 1: `[t, C4=100, E4=null]`,
+  row 2: `[t, C4=100, E4=80]` (C4 carried forward as still active)
+
+### Drums Mode (Long format) — use with: State Timeline + "Partition by values" on DrumName
+
+```
+Field name   | FieldType | Description
+-------------|-----------|----------------------------------------------
+Time         | time      | ms since epoch when state change occurred
+NoteNumber   | number    | MIDI note number (channel 10 only)
+DrumName     | string    | GM1 drum name or "Unknown Drum (note NNN)"
+Velocity     | number    | Velocity (1–127) on Note On; null on Note Off
+```
+
+- One row per state-change event on channel 10 (Note On → velocity, Note Off → null)
+- Filters channel 10 only; non-channel-10 messages are ignored
+- Full event history accumulated since subscription start; re-emitted on each new event
+
+### Drums Mode (Wide format) — use with: State Timeline (native, no transform needed)
+
+```
+Field name   | FieldType | Description
+-------------|-----------|----------------------------------------------
+Time         | time      | ms since epoch when state change occurred
+<DrumName>   | number    | One column per distinct drum seen; value = Velocity|null
+```
+
+- **Stateful**: each row carries the full current state — active drums retain their last velocity
+  until Note Off (null); multiple drums active in parallel appear in the same row
+- **Columns sorted by ascending MIDI note number** (GM1 drum map order, note 35→81)
 
 ---
 
@@ -352,27 +372,23 @@ export function noteToFrequency(noteNumber: number): number {
 
 ## State Transitions
 
-### Note State Machine (per device, per note number)
+### Note Event Stream (per device, Notes mode)
 
 ```
-        Note On (velocity > 0)
-  IDLE ─────────────────────────► ACTIVE
-   ▲                                 │
-   │    Note Off OR                  │
-   │    Note On (velocity = 0)       │
-   └─────────────────────────────────┘
+  MIDI Note On (velocity > 0)  →  append NoteEvent { velocity }
+  MIDI Note Off OR Note On (velocity = 0)  →  append NoteEvent { velocity: null }
 ```
 
-### Drum Hit State Machine (per device, per note number)
+State driven entirely by incoming MIDI messages. Full event history accumulated.
+
+### Drum Event Stream (per device, Drums mode, channel 10 only)
 
 ```
-        Note On received
-  IDLE ────────────────────────► ACTIVE (200ms decay timer starts)
-   ▲                                 │
-   │    200ms elapsed                │
-   │    OR Note Off received         │
-   └─────────────────────────────────┘
+  MIDI Note On ch10  →  append DrumEvent { velocity }
+  MIDI Note Off ch10  →  append DrumEvent { velocity: null }
 ```
+
+State driven entirely by incoming MIDI messages. No timer-based decay.
 
 ### Device Connection State
 
